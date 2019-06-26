@@ -16,6 +16,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+type StartOptions struct {
+	OriginURL string
+	Headers   http.Header
+}
+
 // StdinoutStream is empty struct for wrapping stdin/stdout
 // into a single ReadWriter
 type StdinoutStream struct {
@@ -34,19 +39,27 @@ func (c *StdinoutStream) Write(p []byte) (int, error) {
 
 // StartClient will copy the data from stdin/stdout over a WebSocket connection
 // to the edge (originURL)
-func StartClient(logger *logrus.Logger, originURL string, stream io.ReadWriter, headers http.Header) error {
-	return serveStream(logger, originURL, stream, headers)
+func StartClient(logger *logrus.Logger, stream io.ReadWriter, options *StartOptions) error {
+	return serveStream(logger, stream, options)
 }
 
-// StartServer will setup a server on a specified port and copy data over a WebSocket connection
-// to the edge (originURL)
-func StartServer(logger *logrus.Logger, address, originURL string, shutdownC <-chan struct{}, headers http.Header) error {
+// StartServer will setup a listener on a specified address/port and then
+// forward connections to the origin by calling `Serve()`.
+func StartServer(logger *logrus.Logger, address string, shutdownC <-chan struct{}, options *StartOptions) error {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		logger.WithError(err).Error("failed to start forwarding server")
 		return err
 	}
 	logger.Info("Started listening on ", address)
+	return Serve(logger, listener, shutdownC, options)
+}
+
+// Serve accepts incoming connections on the specified net.Listener.
+// Each connection is handled in a new goroutine: its data is copied over a
+// WebSocket connection to the edge (originURL).
+// `Serve` always closes `listener`.
+func Serve(logger *logrus.Logger, listener net.Listener, shutdownC <-chan struct{}, options *StartOptions) error {
 	defer listener.Close()
 	for {
 		select {
@@ -57,22 +70,22 @@ func StartServer(logger *logrus.Logger, address, originURL string, shutdownC <-c
 			if err != nil {
 				return err
 			}
-			go serveConnection(logger, conn, originURL, headers)
+			go serveConnection(logger, conn, options)
 		}
 	}
 }
 
-// serveConnection handles connections for the StartServer call
-func serveConnection(logger *logrus.Logger, c net.Conn, originURL string, headers http.Header) {
+// serveConnection handles connections for the Serve() call
+func serveConnection(logger *logrus.Logger, c net.Conn, options *StartOptions) {
 	defer c.Close()
-	serveStream(logger, originURL, c, headers)
+	serveStream(logger, c, options)
 }
 
 // serveStream will serve the data over the WebSocket stream
-func serveStream(logger *logrus.Logger, originURL string, conn io.ReadWriter, headers http.Header) error {
-	wsConn, err := createWebsocketStream(originURL, headers)
+func serveStream(logger *logrus.Logger, conn io.ReadWriter, options *StartOptions) error {
+	wsConn, err := createWebsocketStream(options)
 	if err != nil {
-		logger.WithError(err).Errorf("failed to connect to %s\n", originURL)
+		logger.WithError(err).Errorf("failed to connect to %s\n", options.OriginURL)
 		return err
 	}
 	defer wsConn.Close()
@@ -85,12 +98,12 @@ func serveStream(logger *logrus.Logger, originURL string, conn io.ReadWriter, he
 // createWebsocketStream will create a WebSocket connection to stream data over
 // It also handles redirects from Access and will present that flow if
 // the token is not present on the request
-func createWebsocketStream(originURL string, headers http.Header) (*websocket.Conn, error) {
-	req, err := http.NewRequest(http.MethodGet, originURL, nil)
+func createWebsocketStream(options *StartOptions) (*websocket.Conn, error) {
+	req, err := http.NewRequest(http.MethodGet, options.OriginURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header = headers
+	req.Header = options.Headers
 
 	wsConn, resp, err := websocket.ClientConnect(req, nil)
 	if err != nil && resp != nil && resp.StatusCode > 300 {
@@ -101,7 +114,7 @@ func createWebsocketStream(originURL string, headers http.Header) (*websocket.Co
 		if !strings.Contains(location.String(), "cdn-cgi/access/login") {
 			return nil, errors.New("not an Access redirect")
 		}
-		req, err := buildAccessRequest(originURL)
+		req, err := buildAccessRequest(options.OriginURL)
 		if err != nil {
 			return nil, err
 		}

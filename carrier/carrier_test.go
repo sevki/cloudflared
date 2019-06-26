@@ -48,7 +48,11 @@ func TestStartClient(t *testing.T) {
 	defer ts.Close()
 
 	buf := newTestStream()
-	err := StartClient(logger, "http://"+ts.Listener.Addr().String(), buf, nil)
+	options := &StartOptions{
+		OriginURL: "http://" + ts.Listener.Addr().String(),
+		Headers:   nil,
+	}
+	err := StartClient(logger, buf, options)
 	assert.NoError(t, err)
 	buf.Write([]byte(message))
 
@@ -58,24 +62,28 @@ func TestStartClient(t *testing.T) {
 }
 
 func TestStartServer(t *testing.T) {
-	listenerAddress := "localhost:1117"
+	listener, err := net.Listen("tcp", "localhost:")
+	if err != nil {
+		t.Fatalf("Error starting listener: %v", err)
+	}
 	message := "Good morning Austin! Time for another sunny day in the great state of Texas."
 	logger := logrus.New()
 	shutdownC := make(chan struct{})
 	ts := newTestWebSocketServer()
 	defer ts.Close()
+	options := &StartOptions{
+		OriginURL: "http://" + ts.Listener.Addr().String(),
+		Headers:   nil,
+	}
 
 	go func() {
-		err := StartServer(logger, listenerAddress, "http://"+ts.Listener.Addr().String(), shutdownC, nil)
+		err := Serve(logger, listener, shutdownC, options)
 		if err != nil {
-			t.Fatalf("Error starting server: %v", err)
+			t.Fatalf("Error running server: %v", err)
 		}
 	}()
 
-	conn, err := net.Dial("tcp", listenerAddress)
-	if err != nil {
-		t.Fatalf("Error connecting to server: %v", err)
-	}
+	conn, err := net.Dial("tcp", listener.Addr().String())
 	conn.Write([]byte(message))
 
 	readBuffer := make([]byte, len(message))

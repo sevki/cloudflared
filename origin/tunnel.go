@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/h2mux"
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/tunnelrpc"
@@ -33,43 +34,44 @@ import (
 
 const (
 	dialTimeout              = 15 * time.Second
+	openStreamTimeout        = 30 * time.Second
 	lbProbeUserAgentPrefix   = "Mozilla/5.0 (compatible; Cloudflare-Traffic-Manager/1.0; +https://www.cloudflare.com/traffic-manager/;"
 	TagHeaderNamePrefix      = "Cf-Warp-Tag-"
 	DuplicateConnectionError = "EDUPCONN"
 )
 
 type TunnelConfig struct {
+	BuildInfo            *BuildInfo
+	ClientID             string
+	ClientTlsConfig      *tls.Config
+	CloseConnOnce        *sync.Once // Used to close connectedSignal no more than once
+	CompressionQuality   uint64
+	EdgeAddrs            []string
+	GracePeriod          time.Duration
+	HAConnections        int
+	HTTPTransport        http.RoundTripper
+	HeartbeatInterval    time.Duration
+	Hostname             string
+	IncidentLookup       IncidentLookup
+	IsAutoupdated        bool
+	IsFreeTunnel         bool
+	LBPool               string
+	Logger               *log.Logger
+	MaxHeartbeats        uint64
+	Metrics              *TunnelMetrics
+	MetricsUpdateFreq    time.Duration
+	NoChunkedEncoding    bool
+	OriginCert           []byte
+	ReportedVersion      string
+	Retries              uint
+	RunFromTerminal      bool
+	Tags                 []tunnelpogs.Tag
+	TlsConfig            *tls.Config
+	TransportLogger      *log.Logger
+	UseDeclarativeTunnel bool
+	WSGI                 bool
 	// OriginUrl may not be used if a user specifies a unix socket.
 	OriginUrl string
-
-	EdgeAddrs          []string
-	Hostname           string
-	OriginCert         []byte
-	TlsConfig          *tls.Config
-	ClientTlsConfig    *tls.Config
-	Retries            uint
-	HeartbeatInterval  time.Duration
-	MaxHeartbeats      uint64
-	ClientID           string
-	BuildInfo          *BuildInfo
-	ReportedVersion    string
-	LBPool             string
-	Tags               []tunnelpogs.Tag
-	HAConnections      int
-	HTTPTransport      http.RoundTripper
-	Metrics            *TunnelMetrics
-	MetricsUpdateFreq  time.Duration
-	TransportLogger    *log.Logger
-	Logger             *log.Logger
-	IsAutoupdated      bool
-	GracePeriod        time.Duration
-	RunFromTerminal    bool
-	NoChunkedEncoding  bool
-	WSGI               bool
-	CompressionQuality uint64
-	IncidentLookup     IncidentLookup
-	CloseConnOnce      *sync.Once // Used to close connectedSignal no more than once
-	IsFreeTunnel       bool
 }
 
 type dialError struct {
@@ -151,9 +153,25 @@ func StartTunnelDaemon(config *TunnelConfig, shutdownC <-chan struct{}, connecte
 
 	// If a user specified negative HAConnections, we will treat it as requesting 1 connection
 	if config.HAConnections > 1 {
+		if config.UseDeclarativeTunnel {
+			return connection.NewSupervisor(&connection.CloudflaredConfig{
+				ConnectionConfig: &connection.ConnectionConfig{
+					TLSConfig:         config.TlsConfig,
+					HeartbeatInterval: config.HeartbeatInterval,
+					MaxHeartbeats:     config.MaxHeartbeats,
+					Logger:            config.Logger.WithField("subsystem", "connection_supervisor"),
+				},
+				OriginCert:         config.OriginCert,
+				Tags:               config.Tags,
+				EdgeAddrs:          config.EdgeAddrs,
+				HAConnections:      uint(config.HAConnections),
+				Logger:             config.Logger,
+				CloudflaredVersion: config.ReportedVersion,
+			}).Run(ctx)
+		}
 		return NewSupervisor(config).Run(ctx, connectedSignal, u)
 	} else {
-		addrs, err := ResolveEdgeIPs(config.Logger, config.EdgeAddrs)
+		addrs, err := connection.ResolveEdgeIPs(config.Logger, config.EdgeAddrs)
 		if err != nil {
 			return err
 		}
@@ -323,11 +341,7 @@ func RegisterTunnel(
 	uuid uuid.UUID,
 ) error {
 	config.TransportLogger.Debug("initiating RPC stream to register")
-	stream, err := muxer.OpenStream([]h2mux.Header{
-		{Name: ":method", Value: "RPC"},
-		{Name: ":scheme", Value: "capnp"},
-		{Name: ":path", Value: "*"},
-	}, nil)
+	stream, err := openStream(ctx, muxer)
 	if err != nil {
 		// RPC stream open error
 		return newClientRegisterTunnelError(err, config.Metrics.rpcFail)
@@ -383,6 +397,8 @@ func RegisterTunnel(
 		}
 	}
 
+	config.Metrics.userHostnamesCounts.WithLabelValues(registration.Url).Inc()
+
 	config.Logger.Infof("Route propagating, it may take up to 1 minute for your new route to become functional")
 	return nil
 }
@@ -405,11 +421,8 @@ func processRegisterTunnelError(err string, permanentFailure bool, metrics *Tunn
 
 func UnregisterTunnel(muxer *h2mux.Muxer, gracePeriod time.Duration, logger *log.Logger) error {
 	logger.Debug("initiating RPC stream to unregister")
-	stream, err := muxer.OpenStream([]h2mux.Header{
-		{Name: ":method", Value: "RPC"},
-		{Name: ":scheme", Value: "capnp"},
-		{Name: ":path", Value: "*"},
-	}, nil)
+	ctx := context.Background()
+	stream, err := openStream(ctx, muxer)
 	if err != nil {
 		// RPC stream open error
 		return err
@@ -418,7 +431,6 @@ func UnregisterTunnel(muxer *h2mux.Muxer, gracePeriod time.Duration, logger *log
 		// stream response error
 		return err
 	}
-	ctx := context.Background()
 	conn := rpc.NewConn(
 		tunnelrpc.NewTransportLogger(logger.WithField("subsystem", "rpc-unregister"), rpc.StreamTransport(stream)),
 		tunnelrpc.ConnLog(logger.WithField("subsystem", "rpc-transport")),
@@ -427,6 +439,16 @@ func UnregisterTunnel(muxer *h2mux.Muxer, gracePeriod time.Duration, logger *log
 	ts := tunnelpogs.TunnelServer_PogsClient{Client: conn.Bootstrap(ctx)}
 	// gracePeriod is encoded in int64 using capnproto
 	return ts.UnregisterTunnel(ctx, gracePeriod.Nanoseconds())
+}
+
+func openStream(ctx context.Context, muxer *h2mux.Muxer) (*h2mux.MuxedStream, error) {
+	openStreamCtx, cancel := context.WithTimeout(ctx, openStreamTimeout)
+	defer cancel()
+	return muxer.OpenStream(openStreamCtx, []h2mux.Header{
+		{Name: ":method", Value: "RPC"},
+		{Name: ":scheme", Value: "capnp"},
+		{Name: ":path", Value: "*"},
+	}, nil)
 }
 
 func LogServerInfo(
@@ -575,65 +597,93 @@ func (h *TunnelHandler) AppendTagHeaders(r *http.Request) {
 
 func (h *TunnelHandler) ServeStream(stream *h2mux.MuxedStream) error {
 	h.metrics.incrementRequests(h.connectionID)
-	req, err := http.NewRequest("GET", h.originUrl, h2mux.MuxedStreamReader{MuxedStream: stream})
-	if err != nil {
-		h.logger.WithError(err).Panic("Unexpected error from http.NewRequest")
+	defer h.metrics.decrementConcurrentRequests(h.connectionID)
+
+	req, reqErr := h.createRequest(stream)
+	if reqErr != nil {
+		h.logError(stream, reqErr)
+		return reqErr
 	}
-	err = H2RequestHeadersToH1Request(stream.Headers, req)
-	if err != nil {
-		h.logger.WithError(err).Error("invalid request received")
-	}
-	h.AppendTagHeaders(req)
+
 	cfRay := FindCfRayHeader(req)
 	lbProbe := isLBProbeRequest(req)
 	h.logRequest(req, cfRay, lbProbe)
+
+	var resp *http.Response
+	var respErr error
 	if websocket.IsWebSocketUpgrade(req) {
-		conn, response, err := websocket.ClientConnect(req, h.tlsConfig)
-		if err != nil {
-			h.logError(stream, err)
-		} else {
-			stream.WriteHeaders(H1ResponseToH2Response(response))
-			defer conn.Close()
-			// Copy to/from stream to the undelying connection. Use the underlying
-			// connection because cloudflared doesn't operate on the message themselves
-			websocket.Stream(conn.UnderlyingConn(), stream)
-			h.metrics.incrementResponses(h.connectionID, "200")
-			h.logResponse(response, cfRay, lbProbe)
-		}
+		resp, respErr = h.serveWebsocket(stream, req)
 	} else {
-		// Support for WSGI Servers by switching transfer encoding from chunked to gzip/deflate
-		if h.noChunkedEncoding {
-			req.TransferEncoding = []string{"gzip", "deflate"}
-			cLength, err := strconv.Atoi(req.Header.Get("Content-Length"))
-			if err == nil {
-				req.ContentLength = int64(cLength)
-			}
-		}
+		resp, respErr = h.serveHTTP(stream, req)
+	}
+	if respErr != nil {
+		h.logError(stream, respErr)
+		return respErr
+	}
+	h.logResponseOk(resp, cfRay, lbProbe)
+	return nil
+}
 
-		// Request origin to keep connection alive to improve performance
-		req.Header.Set("Connection", "keep-alive")
+func (h *TunnelHandler) createRequest(stream *h2mux.MuxedStream) (*http.Request, error) {
+	req, err := http.NewRequest("GET", h.originUrl, h2mux.MuxedStreamReader{MuxedStream: stream})
+	if err != nil {
+		return nil, errors.Wrap(err, "Unexpected error from http.NewRequest")
+	}
+	err = H2RequestHeadersToH1Request(stream.Headers, req)
+	if err != nil {
+		return nil, errors.Wrap(err, "invalid request received")
+	}
+	h.AppendTagHeaders(req)
+	return req, nil
+}
 
-		response, err := h.httpClient.RoundTrip(req)
+func (h *TunnelHandler) serveWebsocket(stream *h2mux.MuxedStream, req *http.Request) (*http.Response, error) {
+	conn, response, err := websocket.ClientConnect(req, h.tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	err = stream.WriteHeaders(H1ResponseToH2Response(response))
+	if err != nil {
+		return nil, errors.Wrap(err, "Error writing response header")
+	}
+	// Copy to/from stream to the undelying connection. Use the underlying
+	// connection because cloudflared doesn't operate on the message themselves
+	websocket.Stream(conn.UnderlyingConn(), stream)
+	return response, nil
+}
 
-		if err != nil {
-			h.logError(stream, err)
-		} else {
-			defer response.Body.Close()
-			stream.WriteHeaders(H1ResponseToH2Response(response))
-			if h.isEventStream(response) {
-				h.writeEventStream(stream, response.Body)
-			} else {
-				// Use CopyBuffer, because Copy only allocates a 32KiB buffer, and cross-stream
-				// compression generates dictionary on first write
-				io.CopyBuffer(stream, response.Body, make([]byte, 512*1024))
-			}
-
-			h.metrics.incrementResponses(h.connectionID, "200")
-			h.logResponse(response, cfRay, lbProbe)
+func (h *TunnelHandler) serveHTTP(stream *h2mux.MuxedStream, req *http.Request) (*http.Response, error) {
+	// Support for WSGI Servers by switching transfer encoding from chunked to gzip/deflate
+	if h.noChunkedEncoding {
+		req.TransferEncoding = []string{"gzip", "deflate"}
+		cLength, err := strconv.Atoi(req.Header.Get("Content-Length"))
+		if err == nil {
+			req.ContentLength = int64(cLength)
 		}
 	}
-	h.metrics.decrementConcurrentRequests(h.connectionID)
-	return nil
+
+	// Request origin to keep connection alive to improve performance
+	req.Header.Set("Connection", "keep-alive")
+
+	response, err := h.httpClient.RoundTrip(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "Error proxying request to origin")
+	}
+	defer response.Body.Close()
+
+	err = stream.WriteHeaders(H1ResponseToH2Response(response))
+	if err != nil {
+		return nil, errors.Wrap(err, "Error writing response header")
+	}
+	if h.isEventStream(response) {
+		h.writeEventStream(stream, response.Body)
+	} else {
+		// Use CopyBuffer, because Copy only allocates a 32KiB buffer, and cross-stream
+		// compression generates dictionary on first write
+		io.CopyBuffer(stream, response.Body, make([]byte, 512*1024))
+	}
+	return response, nil
 }
 
 func (h *TunnelHandler) writeEventStream(stream *h2mux.MuxedStream, responseBody io.ReadCloser) {
@@ -681,7 +731,8 @@ func (h *TunnelHandler) logRequest(req *http.Request, cfRay string, lbProbe bool
 	}
 }
 
-func (h *TunnelHandler) logResponse(r *http.Response, cfRay string, lbProbe bool) {
+func (h *TunnelHandler) logResponseOk(r *http.Response, cfRay string, lbProbe bool) {
+	h.metrics.incrementResponses(h.connectionID, "200")
 	logger := log.NewEntry(h.logger)
 	if cfRay != "" {
 		logger = logger.WithField("CF-RAY", cfRay)

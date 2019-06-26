@@ -6,14 +6,42 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"text/template"
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/shell"
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/token"
+	"github.com/cloudflare/cloudflared/sshgen"
+	"github.com/cloudflare/cloudflared/validation"
 	"golang.org/x/net/idna"
 
 	"github.com/cloudflare/cloudflared/log"
 	raven "github.com/getsentry/raven-go"
 	cli "gopkg.in/urfave/cli.v2"
+)
+
+const (
+	sshHostnameFlag    = "hostname"
+	sshURLFlag         = "url"
+	sshHeaderFlag      = "header"
+	sshTokenIDFlag     = "service-token-id"
+	sshTokenSecretFlag = "service-token-secret"
+	sshGenCertFlag     = "short-lived-cert"
+	sshConfigTemplate  = `
+Add to your {{.Home}}/.ssh/config:
+
+Host {{.Hostname}}
+{{- if .ShortLivedCerts}}
+  ProxyCommand bash -c '{{.Cloudflared}} access ssh-gen --hostname %h; ssh -tt %r@cfpipe-{{.Hostname}} >&2 <&1' 
+
+Host cfpipe-{{.Hostname}}
+  HostName {{.Hostname}}
+  ProxyCommand {{.Cloudflared}} access ssh --hostname %h
+  IdentityFile ~/.cloudflared/{{.Hostname}}-cf_key
+  CertificateFile ~/.cloudflared/{{.Hostname}}-cf_key-cert.pub
+{{- else}}
+  ProxyCommand {{.Cloudflared}} access ssh --hostname %h
+{{end}}
+`
 )
 
 const sentryDSN = "https://56a9c9fa5c364ab28f34b14f35ea0f1b@sentry.io/189878"
@@ -93,35 +121,57 @@ func Commands() []*cli.Command {
 					Description: `The ssh subcommand sends data over a proxy to the Cloudflare edge.`,
 					Flags: []cli.Flag{
 						&cli.StringFlag{
-							Name:  "hostname",
-							Usage: "specifics the hostname of your application.",
+							Name:  sshHostnameFlag,
+							Usage: "specify the hostname of your application.",
 						},
 						&cli.StringFlag{
-							Name:  "url",
-							Usage: "specifics the host:port to forward data to Cloudflare edge.",
+							Name:  sshURLFlag,
+							Usage: "specify the host:port to forward data to Cloudflare edge.",
 						},
 						&cli.StringSliceFlag{
-							Name:    "header",
+							Name:    sshHeaderFlag,
 							Aliases: []string{"H"},
-							Usage:   "specific additional headers you wish to send.",
+							Usage:   "specify additional headers you wish to send.",
 						},
 						&cli.StringSliceFlag{
-							Name:    "service-token-id",
+							Name:    sshTokenIDFlag,
 							Aliases: []string{"id"},
-							Usage:   "specific an Access service token ID you wish to use.",
+							Usage:   "specify an Access service token ID you wish to use.",
 						},
 						&cli.StringSliceFlag{
-							Name:    "service-token-secret",
+							Name:    sshTokenSecretFlag,
 							Aliases: []string{"secret"},
-							Usage:   "specific an Access service token secret you wish to use.",
+							Usage:   "specify an Access service token secret you wish to use.",
 						},
 					},
 				},
 				{
 					Name:        "ssh-config",
 					Action:      sshConfig,
-					Usage:       "ssh-config",
+					Usage:       "",
 					Description: `Prints an example configuration ~/.ssh/config`,
+					Flags: []cli.Flag{
+						&cli.StringFlag{
+							Name:  sshHostnameFlag,
+							Usage: "specify the hostname of your application.",
+						},
+						&cli.BoolFlag{
+							Name:  sshGenCertFlag,
+							Usage: "specify if you wish to generate short lived certs.",
+						},
+					},
+				},
+				{
+					Name:        "ssh-gen",
+					Action:      sshGen,
+					Usage:       "",
+					Description: `Generates a short lived certificate for given hostname`,
+					Flags: []cli.Flag{
+						&cli.StringFlag{
+							Name:  sshHostnameFlag,
+							Usage: "specify the hostname of your application.",
+						},
+					},
 				},
 			},
 		},
@@ -205,8 +255,49 @@ func generateToken(c *cli.Context) error {
 
 // sshConfig prints an example SSH config to stdout
 func sshConfig(c *cli.Context) error {
-	outputMessage := "Add this configuration block to your %s/.ssh/config:\n\nHost [your hostname]\n\tProxyCommand %s access ssh --hostname %%h\n"
-	logger.Printf(outputMessage, os.Getenv("HOME"), cloudflaredPath())
+	genCertBool := c.Bool(sshGenCertFlag)
+	hostname := c.String(sshHostnameFlag)
+	if hostname == "" {
+		hostname = "[your hostname]"
+	}
+
+	type config struct {
+		Home            string
+		ShortLivedCerts bool
+		Hostname        string
+		Cloudflared     string
+	}
+
+	t := template.Must(template.New("sshConfig").Parse(sshConfigTemplate))
+	return t.Execute(os.Stdout, config{Home: os.Getenv("HOME"), ShortLivedCerts: genCertBool, Hostname: hostname, Cloudflared: cloudflaredPath()})
+}
+
+// sshGen generates a short lived certificate for provided hostname
+func sshGen(c *cli.Context) error {
+	// get the hostname from the cmdline and error out if its not provided
+	rawHostName := c.String(sshHostnameFlag)
+	hostname, err := validation.ValidateHostname(rawHostName)
+	if err != nil || rawHostName == "" {
+		return cli.ShowCommandHelp(c, "ssh-gen")
+	}
+
+	originURL, err := url.Parse("https://" + hostname)
+	if err != nil {
+		return err
+	}
+
+	// this fetchToken function mutates the appURL param. We should refactor that
+	fetchTokenURL := &url.URL{}
+	*fetchTokenURL = *originURL
+	token, err := token.FetchToken(fetchTokenURL)
+	if err != nil {
+		return err
+	}
+
+	if err := sshgen.GenerateShortLivedCertificate(originURL, token); err != nil {
+		return err
+	}
+
 	return nil
 }
 

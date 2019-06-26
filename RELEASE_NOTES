@@ -1,3 +1,30 @@
+2019.6.0
+- 2019-05-17 TUN-1828: Update declarative tunnel config struct
+- 2019-05-29 Handle exit code on err
+- 2019-05-29 AUTH-1802: Fixed ssh-config templating
+- 2019-05-30 TUN-1914: Conflate HTTP and Unix OriginConfig, and add TLS config to WebSocketOriginConfig
+- 2019-06-03 AUTH-1811: ssh-gen config fixes
+
+2019.5.0
+- 2019-04-25 TUN-1781: ServeStream should return early on error
+- 2019-04-30 TUN-1786: Remove low-level Windows service logging
+- 2019-05-03 TUN-1807: Send cloudflared version in Connect RPC
+- 2019-01-23 AUTH-1557: Short Lived Certs
+- 2019-05-13 TUN-1847: Log a distinct message when OpenStream fails while waiting for response headers
+- 2019-05-13 AUTH-1706: fixes and testing
+- 2019-05-22 TUN-1880: Save debug and warn level log to logfile
+- 2019-05-22 AUTH-1781: fixed race condition for short lived certs, doc required config
+
+2019.4.1
+- 2019-03-18 TUN-1626: Create new supervisor to establish connection with origintunneld
+- 2019-04-04 TUN-1619: Add flag to test declarative tunnels.
+- 2019-04-05 TUN-1577: decompose carrier.StartServer to make TestStartServer less flappy
+- 2019-03-29 TUN-1606: Define CloudflaredConfig RPC structure, interface for cloudflared's RPC server
+- 2019-04-02 TUN-1682: Add context to OpenStream to prevent it from blocking indefinitely.
+- 2019-04-16 TUN-1732: cloudflared metrics should track userHostnames
+- 2019-04-17 TUN-1734: Pin packages at exact versions
+- 2019-04-18 TUN-1669: Update license message in help text. Also fix test
+
 2019.4.0
 - 2019-03-28 TUN-1648: ConnectionID is now a UUID
 - 2019-04-01 TUN-1673: Conflate Hello and Connect RPCs

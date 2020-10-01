@@ -33,9 +33,9 @@ require (
 	github.com/jmoiron/sqlx v1.2.0
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
 	github.com/kshvakov/clickhouse v1.3.11
-	github.com/lib/pq v1.2.0
+	github.com/lib/pq v1.3.1-0.20200401001026-356e267cd3f4
 	github.com/mattn/go-colorable v0.1.4
-	github.com/mattn/go-isatty v0.0.10 // indirect
+	github.com/mattn/go-isatty v0.0.13-0.20200128103942-cb30d6282491 // indirect
 	github.com/mattn/go-sqlite3 v1.11.0
 	github.com/mholt/caddy v0.0.0-20180807230124-d3b731e9255b // indirect
 	github.com/miekg/dns v1.1.27
@@ -56,7 +56,7 @@ require (
 	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550
 	golang.org/x/net v0.0.0-20191007182048-72f939374954
 	golang.org/x/sync v0.0.0-20190423024810-112230192c58
-	golang.org/x/sys v0.0.0-20191008105621-543471e840be
+	golang.org/x/sys v0.0.0-20200323222414-85ca7c5b95cd
 	google.golang.org/genproto v0.0.0-20191007204434-a023cd5227bd // indirect
 	google.golang.org/grpc v1.24.0 // indirect
 	gopkg.in/coreos/go-oidc.v2 v2.1.0
